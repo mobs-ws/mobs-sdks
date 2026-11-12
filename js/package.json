@@ -1,0 +1,41 @@
+{
+  "name": "mobs-ws",
+  "version": "0.16.1",
+  "description": "Official client for the MOBS /v1/ws/metar WebSocket (protocol 4).",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "mobs",
+    "metar",
+    "websocket"
+  ],
+  "author": "MOBS <admin@mobs.ws>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mobs-ws/mobs-sdks.git",
+    "directory": "js"
+  },
+  "homepage": "https://github.com/mobs-ws/mobs-sdks#readme",
+  "bugs": {
+    "url": "https://github.com/mobs-ws/mobs-sdks/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

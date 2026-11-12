@@ -1,0 +1,36 @@
+[project]
+name = "mobs-ws"
+version = "0.16.1"
+description = "Official client for the MOBS /v1/ws/metar WebSocket (protocol 4)."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{name = "MOBS", email = "admin@mobs.ws"}]
+dependencies = [
+    "websockets>=17.3",
+]
+keywords = ["mobs", "metar", "websocket"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet",
+]
+
+[project.urls]
+Homepage = "https://mobs.ws"
+Documentation = "https://docs.mobs.ws/websocket"
+Repository = "https://github.com/mobs-ws/mobs-sdks"
+Issues = "https://github.com/mobs-ws/mobs-sdks/issues"
+
+[project.scripts]
+mobs-ws = "mobs_ws.__main__:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
