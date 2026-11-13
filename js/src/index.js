@@ -5,6 +5,17 @@
 // variable. It is never embedded.
 
 export const DEFAULT_URL = "wss://mobs.ws/v1/ws/metar";
+export const MAX_GRANTS = 10;
+export const KNOWN_PLATFORMS = Object.freeze(["polymarket_com", "polymarket_us"]);
+export const ERROR_CODES = Object.freeze([
+  "invalid_airports",
+  "bad_request",
+  "unknown_action",
+  "too_many_airports",
+  "invalid_region",
+  "unknown_platform",
+  "too_many_grants",
+]);
 export const PING_EVERY_MS = 20000;
 export const PONG_TIMEOUT_MS = 15000;
 export const BACKOFF_START_MS = 1000;
@@ -125,6 +136,9 @@ export class MetarClient {
     url = DEFAULT_URL,
     snapshot = true,
     resume = true,
+    state = null,
+    bbox = null,
+    platform = null,
     onRecord = null,
     onFrame = null,
   } = {}) {
@@ -146,24 +160,47 @@ export class MetarClient {
     this.lastLate = null;
     this.lastRecovered = null;
     this.lates = {};
+    this.lastError = null;
+    this.heldIcaos = this.airports.slice();
+    this.states = [];
+    this.bboxes = [];
+    this.platforms = [];
+    this._sessionOpen = false;
+    this._grantResumePending = false;
+    if (state) this.states.push(String(state).toUpperCase());
+    if (bbox) this.bboxes.push(Object.assign({}, bbox));
+    if (platform) this.platforms.push(String(platform).toLowerCase());
   }
 
   handshakeUrl() {
+    const useResume = this.resume && !this.hasGrants();
     return handshakeUrl(this.url, this.airports, {
-      snapshot: this.snapshot,
-      sinceSeq: this.resume ? this.seq : null,
-      bootId: this.resume ? this.bootId : null,
+      snapshot: this.hasGrants() ? false : this.snapshot,
+      sinceSeq: useResume ? this.seq : null,
+      bootId: useResume ? this.bootId : null,
     });
+  }
+
+  hasGrants() {
+    return this.states.length > 0 || this.bboxes.length > 0 || this.platforms.length > 0;
   }
 
   handleFrame(message) {
     const kind = message && message.type;
     if (kind === "subscription_updated") {
       if (message.boot_id) this.bootId = message.boot_id;
+      if (Array.isArray(message.icaos)) {
+        this.heldIcaos = message.icaos.map((item) => String(item).toUpperCase());
+      }
+      if (this._sessionOpen) this._rememberGrantsFrom(message);
+      else if (this.hasGrants()) this._grantResumePending = true;
+      this._sessionOpen = true;
       // Do not take seq from subscription_updated: it is the server's
       // current seq, and would skip replay frames not yet received.
+    } else if (kind === "error") {
+      this.lastError = message;
     } else if (kind === "resume") {
-      return fetchLatest(this.url, this.token, this.airports).then((rows) => {
+      return fetchLatest(this.url, this.token, this.heldIcaos.length ? this.heldIcaos : this.airports).then((rows) => {
         for (const rec of rows) {
           const before = this.latest[rec.icao];
           mergeRecord(this.latest, rec, false);
@@ -222,10 +259,113 @@ export class MetarClient {
     }
   }
 
+  subscribeBody(icaos, fields = {}) {
+    const body = {action: "subscribe"};
+    if (icaos != null) body.icaos = icaos.map((item) => String(item).toUpperCase());
+    if (fields.state != null) body.state = String(fields.state).toUpperCase();
+    if (fields.bbox != null) body.bbox = Object.assign({}, fields.bbox);
+    if (fields.platform != null) body.platform = String(fields.platform).toLowerCase();
+    if (fields.since_seq != null && fields.boot_id) {
+      body.since_seq = fields.since_seq;
+      body.boot_id = fields.boot_id;
+    }
+    if (fields.snapshot != null) body.snapshot = Boolean(fields.snapshot);
+    for (const [key, value] of Object.entries(fields)) {
+      if (!["state", "bbox", "platform", "since_seq", "boot_id", "snapshot"].includes(key)) {
+        body[key] = value;
+      }
+    }
+    return body;
+  }
+
+  reconnectSubscribeBodies() {
+    const states = this.states.slice();
+    const bboxes = this.bboxes.slice();
+    const platforms = this.platforms.slice();
+    const first = this.subscribeBody(this.airports.length ? this.airports : null, {
+      state: states.length ? states.shift() : null,
+      bbox: bboxes.length ? bboxes.shift() : null,
+      platform: platforms.length ? platforms.shift() : null,
+      since_seq: this.resume ? this.seq : null,
+      boot_id: this.resume ? this.bootId : null,
+      snapshot: this.snapshot ? true : null,
+    });
+    const bodies = [first];
+    while (states.length || bboxes.length || platforms.length) {
+      bodies.push(this.subscribeBody(null, {
+        state: states.length ? states.shift() : null,
+        bbox: bboxes.length ? bboxes.shift() : null,
+        platform: platforms.length ? platforms.shift() : null,
+        snapshot: true,
+      }));
+    }
+    return bodies;
+  }
+
+  _rememberGrantsFrom(message) {
+    const regions = message.regions || [];
+    const platforms = message.platforms || [];
+    const states = [];
+    const bboxes = [];
+    for (const item of regions) {
+      const raw = String(item);
+      if (raw.toLowerCase().startsWith("state:")) states.push(raw.split(":").slice(1).join(":").toUpperCase());
+      else if (raw.toLowerCase().startsWith("bbox:")) {
+        const parts = raw.split(":").slice(1).join(":").split(",");
+        if (parts.length === 4) {
+          const nums = parts.map(Number);
+          if (nums.every((n) => Number.isFinite(n))) {
+            bboxes.push({south: nums[0], west: nums[1], north: nums[2], east: nums[3]});
+          }
+        }
+      }
+    }
+    this.states = states;
+    this.bboxes = bboxes;
+    this.platforms = platforms.map((name) => String(name).toLowerCase());
+  }
+
+  _rememberOutgoingGrants(body) {
+    if (body.state && !this.states.includes(body.state)) this.states.push(body.state);
+    if (body.bbox) this.bboxes.push(Object.assign({}, body.bbox));
+    if (body.platform && !this.platforms.includes(body.platform)) this.platforms.push(body.platform);
+    if (Array.isArray(body.icaos)) {
+      for (const item of body.icaos) {
+        const code = String(item).toUpperCase();
+        if (!this.airports.includes(code)) this.airports.push(code);
+      }
+    }
+  }
+
   subscribe(icaos = [], fields = {}) {
     const ws = this._ws;
     if (!ws || ws.readyState !== 1) return;
-    ws.send(JSON.stringify(Object.assign({action: "subscribe", icaos}, fields)));
+    const body = this.subscribeBody(icaos, fields);
+    this._rememberOutgoingGrants(body);
+    ws.send(JSON.stringify(body));
+  }
+
+  unsubscribe(icaos = null, fields = {}) {
+    const ws = this._ws;
+    if (!ws || ws.readyState !== 1) return;
+    const body = {action: "unsubscribe"};
+    if (icaos != null) body.icaos = icaos.map((item) => String(item).toUpperCase());
+    if (fields.state != null) body.state = String(fields.state).toUpperCase();
+    if (fields.bbox != null) body.bbox = Object.assign({}, fields.bbox);
+    if (fields.platform != null) body.platform = String(fields.platform).toLowerCase();
+    for (const [key, value] of Object.entries(fields)) {
+      if (!["state", "bbox", "platform"].includes(key)) body[key] = value;
+    }
+    ws.send(JSON.stringify(body));
+  }
+
+  _flushGrantResume() {
+    const ws = this._ws;
+    if (!this._grantResumePending || !ws || ws.readyState !== 1) return;
+    this._grantResumePending = false;
+    for (const body of this.reconnectSubscribeBodies()) {
+      ws.send(JSON.stringify(body));
+    }
   }
 
   stop() {
@@ -268,6 +408,8 @@ export class MetarClient {
         return;
       }
       this._ws = ws;
+      this._sessionOpen = false;
+      this._grantResumePending = false;
 
       ws.addEventListener("open", () => {
         openedAt = Date.now();
@@ -296,7 +438,9 @@ export class MetarClient {
           clearTimeout(pongTimer);
           pongTimer = null;
         }
-        this.handleFrame(message);
+        const result = this.handleFrame(message);
+        if (result && typeof result.then === "function") result.then(() => this._flushGrantResume());
+        else this._flushGrantResume();
       });
 
       ws.addEventListener("close", (event) => {

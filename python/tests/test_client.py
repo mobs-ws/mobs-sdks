@@ -171,3 +171,117 @@ def test_connect_asyncio_timeout_backs_off(monkeypatch):
         assert codes[0] == 1006 and len(codes) >= 2
 
     asyncio.run(run())
+
+
+def test_version_is_0170():
+    assert mobs_ws.__version__ == "0.17.0"
+    assert mobs_ws.MAX_GRANTS == 10
+    assert "invalid_region" in mobs_ws.ERROR_CODES
+    assert "unknown_platform" in mobs_ws.ERROR_CODES
+    assert "too_many_grants" in mobs_ws.ERROR_CODES
+    assert mobs_ws.KNOWN_PLATFORMS == frozenset({"polymarket_com", "polymarket_us"})
+
+
+def test_subscribe_body_matches_wire_format():
+    client = MetarClient(["klga"], token="YOUR_API_KEY")
+    box = {"south": 40.0, "west": -75.0, "north": 41.5, "east": -73.0}
+    body = client.subscribe_body(
+        ["klga"],
+        state="ny",
+        bbox=box,
+        platform="POLYMARKET_COM",
+        snapshot=True,
+        filter={"speci": True},
+    )
+    assert body == {
+        "action": "subscribe",
+        "icaos": ["KLGA"],
+        "state": "NY",
+        "bbox": box,
+        "platform": "polymarket_com",
+        "snapshot": True,
+        "filter": {"speci": True},
+    }
+
+
+def test_grant_reconnect_sends_since_seq_and_grants():
+    client = MetarClient(
+        [],
+        token="YOUR_API_KEY",
+        platform="polymarket_com",
+        state="NY",
+        snapshot=True,
+        resume=True,
+    )
+    assert client.has_grants()
+    url = client.handshake_url()
+    assert "since_seq=" not in url
+    assert "boot_id=" not in url
+    client.seq = 12
+    client.boot_id = "boot"
+    bodies = client.reconnect_subscribe_bodies()
+    assert len(bodies) == 1
+    assert bodies[0]["action"] == "subscribe"
+    assert bodies[0]["state"] == "NY"
+    assert bodies[0]["platform"] == "polymarket_com"
+    assert bodies[0]["since_seq"] == 12
+    assert bodies[0]["boot_id"] == "boot"
+    assert bodies[0]["snapshot"] is True
+
+
+def test_grant_reconnect_extra_states_restored_by_snapshot():
+    client = MetarClient(
+        [],
+        token="YOUR_API_KEY",
+        platform="polymarket_us",
+        state="NY",
+        snapshot=True,
+        resume=True,
+    )
+    client._remember_outgoing_grants(client.subscribe_body(state="TX"))
+    client.seq = 12
+    client.boot_id = "boot"
+    bodies = client.reconnect_subscribe_bodies()
+    assert len(bodies) == 2
+    assert bodies[0]["action"] == "subscribe"
+    assert bodies[0]["state"] == "NY"
+    assert bodies[0]["platform"] == "polymarket_us"
+    assert bodies[0]["since_seq"] == 12
+    assert bodies[0]["boot_id"] == "boot"
+    assert bodies[0]["snapshot"] is True
+    assert bodies[1]["action"] == "subscribe"
+    assert bodies[1]["state"] == "TX"
+    assert "platform" not in bodies[1]
+    assert "since_seq" not in bodies[1]
+    assert "boot_id" not in bodies[1]
+    assert bodies[1]["snapshot"] is True
+
+
+def test_errors_and_cached_snapshot_and_grant_hello():
+    client = MetarClient([], token="YOUR_API_KEY", platform="polymarket_us")
+    rec = {"icao": "KNYC", "versions": "v1", "obs_time": "t", "raw_metar": "A"}
+    client.handle_frame({"type": "new_metar_arrived", "cached": True, "replay": False, "seq": 80, "data": [rec]})
+    assert client.latest["KNYC"]["raw_metar"] == "A"
+    assert client.seq is None
+    for code in ("invalid_region", "unknown_platform", "too_many_grants"):
+        client.handle_frame({"type": "error", "code": code, "message": code})
+        assert client.last_error["code"] == code
+    # Opening hello with constructor grants queues a resubscribe, and does not
+    # wipe the constructor grant lists.
+    client.handle_frame({"type": "subscription_updated", "icaos": [], "boot_id": "boot", "seq": 1, "resume": None, "replayed": None})
+    assert client._grant_resume_pending is True
+    assert client.platforms == ["polymarket_us"]
+    client.handle_frame(
+        {
+            "type": "subscription_updated",
+            "icaos": ["KNYC", "KSFO", "KMIA", "KMDW", "KLAX"],
+            "platforms": ["polymarket_us"],
+            "boot_id": "boot",
+            "seq": 1,
+            "resume": "full",
+            "replayed": 4,
+        }
+    )
+    assert client.held_icaos == ["KNYC", "KSFO", "KMIA", "KMDW", "KLAX"]
+    assert client.platforms == ["polymarket_us"]
+    assert client.seq is None
