@@ -4,6 +4,9 @@ from mobs_ws.client import (
     BACKOFF_CAP_S,
     BACKOFF_START_S,
     DEFAULT_URL,
+    ERROR_CODES,
+    KNOWN_PLATFORMS,
+    MAX_GRANTS,
     PING_EVERY_S,
     PONG_TIMEOUT_S,
     QUIET_OPEN_S,
@@ -23,6 +26,9 @@ __all__ = [
     "BACKOFF_CAP_S",
     "BACKOFF_START_S",
     "DEFAULT_URL",
+    "ERROR_CODES",
+    "KNOWN_PLATFORMS",
+    "MAX_GRANTS",
     "PING_EVERY_S",
     "PONG_TIMEOUT_S",
     "QUIET_OPEN_S",
@@ -38,4 +44,4 @@ __all__ = [
     "should_retry",
 ]
 
-__version__ = "0.16.1"
+__version__ = "0.17.0"

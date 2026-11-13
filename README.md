@@ -10,8 +10,11 @@ WebSocket. Full documentation: https://docs.mobs.ws
 
 Both clients speak **protocol 4** (snapshot, resume, `awc_confirmed`,
 `station_late` / `station_recovered`, change-only `filter`, parsed `delta`,
-and the `usage` frame). They ignore unknown frame types, so newer servers
-stay compatible. Your API key is never embedded: pass it in or set
+the `usage` frame, and — from 0.17.0 — US `state` / `bbox` region grants
+and `polymarket_com` / `polymarket_us` platform grants). A grant counts
+as one subscription; a socket may hold at most 10. Snapshot frames are
+marked `cached`. They ignore unknown frame types, so newer servers stay
+compatible. Your API key is never embedded: pass it in or set
 `MOBS_TOKEN`.
 
 ## Releases

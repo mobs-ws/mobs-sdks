@@ -92,3 +92,88 @@ test("late alerts are tracked per outage and cleared on recovery", () => {
   assert.equal(client.lastLate, null);
   assert.equal(client.seq, 12);
 });
+
+test("version is 0.17.0 and new error codes are exported", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { MAX_GRANTS, ERROR_CODES, KNOWN_PLATFORMS } = await import("../src/index.js");
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(pkg.version, "0.17.0");
+  assert.equal(MAX_GRANTS, 10);
+  assert.ok(ERROR_CODES.includes("invalid_region"));
+  assert.ok(ERROR_CODES.includes("unknown_platform"));
+  assert.ok(ERROR_CODES.includes("too_many_grants"));
+  assert.deepEqual([...KNOWN_PLATFORMS], ["polymarket_com", "polymarket_us"]);
+});
+
+test("subscribe body matches the v0.17.0 wire format", () => {
+  const client = new MetarClient({token: "YOUR_API_KEY", airports: ["klga"]});
+  const box = {south: 40.0, west: -75.0, north: 41.5, east: -73.0};
+  const body = client.subscribeBody(["klga"], {
+    state: "ny",
+    bbox: box,
+    platform: "POLYMARKET_COM",
+    snapshot: true,
+    filter: {speci: true},
+  });
+  assert.deepEqual(body, {
+    action: "subscribe",
+    icaos: ["KLGA"],
+    state: "NY",
+    bbox: box,
+    platform: "polymarket_com",
+    snapshot: true,
+    filter: {speci: true},
+  });
+});
+
+test("grant reconnect sends since_seq and grants, not on the handshake", () => {
+  const client = new MetarClient({
+    token: "YOUR_API_KEY",
+    airports: [],
+    platform: "polymarket_com",
+    state: "NY",
+    snapshot: true,
+    resume: true,
+  });
+  assert.equal(client.hasGrants(), true);
+  const url = client.handshakeUrl();
+  assert.doesNotMatch(url, /since_seq=/);
+  assert.doesNotMatch(url, /boot_id=/);
+  client.seq = 12;
+  client.bootId = "boot";
+  const bodies = client.reconnectSubscribeBodies();
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].action, "subscribe");
+  assert.equal(bodies[0].state, "NY");
+  assert.equal(bodies[0].platform, "polymarket_com");
+  assert.equal(bodies[0].since_seq, 12);
+  assert.equal(bodies[0].boot_id, "boot");
+  assert.equal(bodies[0].snapshot, true);
+});
+
+test("cached snapshots merge without advancing seq; errors are recorded", () => {
+  const client = new MetarClient({token: "YOUR_API_KEY", airports: [], platform: "polymarket_us"});
+  const rec = {icao: "KNYC", versions: "v1", obs_time: "t", raw_metar: "A"};
+  client.handleFrame({type: "new_metar_arrived", cached: true, replay: false, seq: 80, data: [rec]});
+  assert.equal(client.latest.KNYC.raw_metar, "A");
+  assert.equal(client.seq, null);
+  for (const code of ["invalid_region", "unknown_platform", "too_many_grants"]) {
+    client.handleFrame({type: "error", code, message: code});
+    assert.equal(client.lastError.code, code);
+  }
+  client.handleFrame({type: "subscription_updated", icaos: [], boot_id: "boot", seq: 1, resume: null, replayed: null});
+  assert.equal(client._grantResumePending, true);
+  assert.deepEqual(client.platforms, ["polymarket_us"]);
+  client.handleFrame({
+    type: "subscription_updated",
+    icaos: ["KNYC", "KSFO", "KMIA", "KMDW", "KLAX"],
+    platforms: ["polymarket_us"],
+    boot_id: "boot",
+    seq: 1,
+    resume: "full",
+    replayed: 4,
+  });
+  assert.deepEqual(client.heldIcaos, ["KNYC", "KSFO", "KMIA", "KMDW", "KLAX"]);
+  assert.deepEqual(client.platforms, ["polymarket_us"]);
+  assert.equal(client.seq, null);
+});
