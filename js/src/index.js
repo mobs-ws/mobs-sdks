@@ -3,6 +3,11 @@
 // No runtime dependencies: uses the global WebSocket (browser and Node 22+).
 // The token comes only from the caller or the MOBS_TOKEN environment
 // variable. It is never embedded.
+// 0.18.0 (server v0.44.0+): per-station D-ATIS (`datis` option or
+// subscribeDatis(); the key needs the `datis` scope), new_datis_arrived kept
+// per (icao, type) newest issued_at then revision, onDatis, datis_fallback
+// resync from GET /v1/datis/latest, and feed_notice (`notices`,
+// onFeedNotice; opt out with `notices: false`).
 
 export const DEFAULT_URL = "wss://mobs.ws/v1/ws/metar";
 export const MAX_GRANTS = 10;
@@ -15,7 +20,11 @@ export const ERROR_CODES = Object.freeze([
   "invalid_region",
   "unknown_platform",
   "too_many_grants",
+  "forbidden",
+  "unavailable",
 ]);
+export const DATIS_TYPES = Object.freeze(["combined", "arr", "dep"]);
+export const DATIS_UNSUPPORTED = "server does not support D-ATIS";
 export const PING_EVERY_MS = 20000;
 export const PONG_TIMEOUT_MS = 15000;
 export const BACKOFF_START_MS = 1000;
@@ -75,9 +84,62 @@ export function applyAwcConfirmed(latest, message) {
   return latest;
 }
 
-export function handshakeUrl(base, airports, {snapshot = true, sinceSeq = null, bootId = null} = {}) {
+/**
+ * One D-ATIS bulletin (`data[]` of new_datis_arrived, and GET /v1/datis rows).
+ * @typedef {Object} DatisRecord
+ * @property {string} icao
+ * @property {"combined"|"arr"|"dep"} type
+ * @property {string} letter
+ * @property {string} issued_at      ISO 8601, milliseconds, Z
+ * @property {string|null} datis_time HHMM as broadcast
+ * @property {string} text
+ * @property {string} arrived_at
+ * @property {"swim"|"atis.info"} source
+ * @property {string|null} source_time
+ * @property {number} revision
+ * @property {string} versions       e.g. "KLGA/combined/U/2026-11-19T11:51Z/0"
+ */
+
+/**
+ * One feed notice (`feed_notice.notices[]` and /v1/status `notices[]`).
+ * @typedef {Object} FeedNotice
+ * @property {string} id
+ * @property {"metar"|"datis"} feed
+ * @property {string|null} source
+ * @property {string[]|null} icaos
+ * @property {string} kind
+ * @property {string} message
+ * @property {string} starts_at
+ * @property {string|null} ends_at
+ * @property {string} posted_at
+ * @property {string} posted_by
+ */
+
+export function datisKey(record) {
+  return String((record && record.icao) || "").toUpperCase() + "/" + String((record && record.type) || "");
+}
+
+/** Keep the newest bulletin per icao/type: later issued_at, then higher revision. True when it changed. */
+export function mergeDatis(latest, record) {
+  if (!record || !record.icao || !record.type) return false;
+  const key = datisKey(record);
+  const held = latest[key];
+  if (held) {
+    if (record.versions === held.versions) return false;
+    const mine = String(record.issued_at || "");
+    const theirs = String(held.issued_at || "");
+    if (mine < theirs) return false;
+    if (mine === theirs && Number(record.revision || 0) < Number(held.revision || 0)) return false;
+  }
+  latest[key] = Object.assign({}, record);
+  return true;
+}
+
+export function handshakeUrl(base, airports, {snapshot = true, sinceSeq = null, bootId = null, datis = null, notices = true} = {}) {
   const url = new URL(base);
   url.searchParams.set("airports", airports.join(","));
+  if (datis && datis.length) url.searchParams.set("datis", datis.join(","));
+  if (!notices) url.searchParams.set("notices", "false");
   if (snapshot) url.searchParams.set("snapshot", "true");
   if (sinceSeq != null && bootId) {
     url.searchParams.set("since_seq", String(sinceSeq));
@@ -86,10 +148,10 @@ export function handshakeUrl(base, airports, {snapshot = true, sinceSeq = null, 
   return url.toString();
 }
 
-export function latestUrl(wsUrl, airports) {
+export function latestUrl(wsUrl, airports, path = "/v1/metar/latest") {
   const url = new URL(wsUrl);
   url.protocol = url.protocol === "wss:" || url.protocol === "https:" ? "https:" : "http:";
-  url.pathname = "/v1/metar/latest";
+  url.pathname = path;
   url.search = new URLSearchParams({airports: airports.join(",")}).toString();
   return url.toString();
 }
@@ -98,6 +160,23 @@ export async function fetchLatest(wsUrl, token, airports) {
   try {
     const headers = token ? {Authorization: "Bearer " + token} : {};
     const response = await fetch(latestUrl(wsUrl, airports), {headers});
+    if (!response.ok) return [];
+    const body = await response.json();
+    return body.data || [];
+  } catch {
+    return [];
+  }
+}
+
+export function datisLatestUrl(wsUrl, icaos) {
+  return latestUrl(wsUrl, icaos, "/v1/datis/latest");
+}
+
+export async function fetchDatisLatest(wsUrl, token, icaos) {
+  if (!icaos || !icaos.length) return [];
+  try {
+    const headers = token ? {Authorization: "Bearer " + token} : {};
+    const response = await fetch(datisLatestUrl(wsUrl, icaos), {headers});
     if (!response.ok) return [];
     const body = await response.json();
     return body.data || [];
@@ -141,6 +220,11 @@ export class MetarClient {
     platform = null,
     onRecord = null,
     onFrame = null,
+    datis = null,
+    datisTypes = null,
+    onDatis = null,
+    notices = true,
+    onFeedNotice = null,
   } = {}) {
     this.url = url;
     this.token = resolveToken(token);
@@ -167,6 +251,20 @@ export class MetarClient {
     this.platforms = [];
     this._sessionOpen = false;
     this._grantResumePending = false;
+    // 0.18.0: D-ATIS and feed notices.
+    this.datis = (datis || []).map((name) => String(name).toUpperCase());
+    this.datisTypes = datisTypes && datisTypes.length ? datisTypes.slice() : null;
+    this.onDatis = onDatis;
+    this.datisLatest = {};
+    this.heldDatis = this.datis.slice();
+    this.heldDatisTypes = [];
+    this.datisSupported = null; // null until the first subscription_updated
+    this.noticesEnabled = Boolean(notices);
+    this.notices = [];
+    this.onFeedNotice = onFeedNotice;
+    this._datisTypesPending = false;
+    this.fetchLatest = fetchLatest;
+    this.fetchDatisLatest = fetchDatisLatest;
     if (state) this.states.push(String(state).toUpperCase());
     if (bbox) this.bboxes.push(Object.assign({}, bbox));
     if (platform) this.platforms.push(String(platform).toLowerCase());
@@ -178,6 +276,8 @@ export class MetarClient {
       snapshot: this.hasGrants() ? false : this.snapshot,
       sinceSeq: useResume ? this.seq : null,
       bootId: useResume ? this.bootId : null,
+      datis: this.datis,
+      notices: this.noticesEnabled,
     });
   }
 
@@ -192,6 +292,7 @@ export class MetarClient {
       if (Array.isArray(message.icaos)) {
         this.heldIcaos = message.icaos.map((item) => String(item).toUpperCase());
       }
+      this._noteDatis(message);
       if (this._sessionOpen) this._rememberGrantsFrom(message);
       else if (this.hasGrants()) this._grantResumePending = true;
       this._sessionOpen = true;
@@ -199,15 +300,28 @@ export class MetarClient {
       // current seq, and would skip replay frames not yet received.
     } else if (kind === "error") {
       this.lastError = message;
+      // A server that knows D-ATIS but refused it (no datis scope, or the product is off).
+      if (message.code === "forbidden" || message.code === "unavailable") this.datisSupported = null;
     } else if (kind === "resume") {
-      return fetchLatest(this.url, this.token, this.heldIcaos.length ? this.heldIcaos : this.airports).then((rows) => {
+      const metar = this.fetchLatest(this.url, this.token, this.heldIcaos.length ? this.heldIcaos : this.airports);
+      const datis = message.datis_fallback && this.heldDatis.length
+        ? this.fetchDatisLatest(this.url, this.token, this.heldDatis)
+        : Promise.resolve([]);
+      return Promise.all([metar, datis]).then(([rows, datisRows]) => {
         for (const rec of rows) {
           const before = this.latest[rec.icao];
           mergeRecord(this.latest, rec, false);
           this._emit(rec.icao, before);
         }
+        this._applyDatis(datisRows);
         if (this.onFrame) this.onFrame(message);
       });
+    } else if (kind === "new_datis_arrived") {
+      this._applyDatis(message.data || []);
+      if (message.cached !== true && message.seq != null) this._advanceSeq(message.seq);
+    } else if (kind === "feed_notice") {
+      this.notices = Array.isArray(message.notices) ? message.notices.slice() : [];
+      if (this.onFeedNotice) this.onFeedNotice(this.notices);
     } else if (kind === "new_metar_arrived") {
       const live = message.cached === false && message.replay === false;
       const replayed = message.replay === true;
@@ -238,6 +352,75 @@ export class MetarClient {
       }
     }
     if (this.onFrame) this.onFrame(message);
+  }
+
+  _noteDatis(message) {
+    const first = !this._sessionOpen;
+    if (Array.isArray(message.datis_icaos)) {
+      this.datisSupported = true;
+      this.heldDatis = message.datis_icaos.map((item) => String(item).toUpperCase());
+      if (Array.isArray(message.datis_types)) this.heldDatisTypes = message.datis_types.map(String);
+      // datis_types are subscribe-only: send the wanted types once per socket.
+      if (first && this.datisTypes) {
+        const want = [...this.datisTypes].sort().join(",");
+        const have = [...this.heldDatisTypes].sort().join(",");
+        if (want !== have) this._datisTypesPending = true;
+      }
+    } else if (this.datisSupported === true) {
+      this.heldDatis = [];
+      this.heldDatisTypes = [];
+    } else if (this.datis.length && first) {
+      // Asked for D-ATIS and the first answer has no datis_icaos: the server predates v0.44.0.
+      // A v0.44.0 server that refuses it follows with forbidden or unavailable, which resets this.
+      this.datisSupported = false;
+      this.lastError = {type: "error", code: "unsupported", message: DATIS_UNSUPPORTED};
+    }
+  }
+
+  _applyDatis(rows) {
+    for (const rec of rows || []) {
+      if (mergeDatis(this.datisLatest, rec) && this.onDatis) this.onDatis(this.datisLatest[datisKey(rec)]);
+    }
+  }
+
+  _requireDatis() {
+    if (this.datisSupported === false) throw new Error(DATIS_UNSUPPORTED);
+  }
+
+  /** Add D-ATIS stations mid-session. Throws "server does not support D-ATIS" on an old server. */
+  subscribeDatis(icaos, {types = null, snapshot = null} = {}) {
+    this._requireDatis();
+    const codes = icaos.map((item) => String(item).toUpperCase());
+    for (const code of codes) if (!this.datis.includes(code)) this.datis.push(code);
+    const fields = {datis: codes};
+    if (types != null) {
+      fields.datis_types = types.slice();
+      this.datisTypes = types.slice();
+    }
+    if (snapshot != null) fields.snapshot = snapshot;
+    const ws = this._ws;
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify(this.subscribeBody(null, fields)));
+  }
+
+  /** Drop D-ATIS stations mid-session; METAR stations are untouched. */
+  unsubscribeDatis(icaos) {
+    this._requireDatis();
+    const codes = [...new Set(icaos.map((item) => String(item).toUpperCase()))].sort();
+    this.datis = this.datis.filter((code) => !codes.includes(code));
+    for (const key of Object.keys(this.datisLatest)) {
+      if (codes.includes(key.split("/")[0])) delete this.datisLatest[key];
+    }
+    const ws = this._ws;
+    if (!ws || ws.readyState !== 1) return;
+    ws.send(JSON.stringify({action: "unsubscribe", datis: codes}));
+  }
+
+  /** Turn feed_notice frames on or off for this socket (and later reconnects). */
+  setNotices(enabled) {
+    this.noticesEnabled = Boolean(enabled);
+    const ws = this._ws;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({action: "subscribe", notices: this.noticesEnabled}));
   }
 
   _advanceSeq(seq) {
@@ -361,6 +544,10 @@ export class MetarClient {
 
   _flushGrantResume() {
     const ws = this._ws;
+    if (this._datisTypesPending && ws && ws.readyState === 1) {
+      this._datisTypesPending = false;
+      ws.send(JSON.stringify({action: "subscribe", datis: this.datis.slice(), datis_types: (this.datisTypes || []).slice()}));
+    }
     if (!this._grantResumePending || !ws || ws.readyState !== 1) return;
     this._grantResumePending = false;
     for (const body of this.reconnectSubscribeBodies()) {
@@ -410,6 +597,7 @@ export class MetarClient {
       this._ws = ws;
       this._sessionOpen = false;
       this._grantResumePending = false;
+      this._datisTypesPending = false;
 
       ws.addEventListener("open", () => {
         openedAt = Date.now();

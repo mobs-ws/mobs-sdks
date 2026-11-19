@@ -2,8 +2,8 @@
 
 Official JavaScript client for the MOBS `/v1/ws/metar` WebSocket (protocol 4).
 
-Requires Node 22+ (or a browser) and `mobs-ws` 0.17.0 for region and
-platform subscriptions. There are no runtime dependencies. The client
+Requires Node 22+ (or a browser). `mobs-ws` 0.17.0+ for region and
+platform subscriptions, 0.18.0 for D-ATIS and feed notices (server v0.44.0+). There are no runtime dependencies. The client
 uses the global `WebSocket` in the browser and in Node 22+. Snapshot
 and resume are opt-in. The client applies `awc_confirmed` frames
 last-wins per (`icao`, `versions`), handles `station_late`,
@@ -30,7 +30,7 @@ uses `?token=` because a page cannot set socket headers. A browser
 `WebSocket` cannot see a handshake 401 or 403, so the client retries.
 
 ```bash
-npm install mobs-ws@0.17.0
+npm install mobs-ws@0.18.0
 export MOBS_TOKEN=$MOBS_TOKEN
 ```
 
@@ -49,6 +49,36 @@ const client = new MetarClient({
 // Mid-session: client.subscribe([], {state: "NY"})
 // or client.subscribe([], {bbox: {south:40.0,west:-75.0,north:41.5,east:-73.0}})
 await client.runForever();
+```
+
+## D-ATIS and feed notices (0.18.0, server v0.44.0+)
+
+Pass `datis: ["KLGA"]` (handshake) or call `client.subscribeDatis(["KJFK"], {types: ["combined"]})`
+mid-session; `client.unsubscribeDatis([...])` drops them without touching METAR. The key needs
+the `datis` scope. Each `new_datis_arrived` record (`DatisRecord` JSDoc type) is kept in
+`datisLatest["ICAO/type"]`: a later `issued_at` wins, then a higher `revision`. `onDatis(record)`
+fires when it changes. Snapshot frames (`cached: true`) do not advance `seq`. `backlog: true` marks a
+newer copy that arrived late. `datisTypes` (`combined`, `arr`, `dep`) are sent with a subscribe
+once the socket opens. On a resume fallback with `datis_fallback`, the client refetches
+`GET /v1/datis/latest`.
+
+A server without D-ATIS answers with no `datis_icaos`. The client then sets `datisSupported = false`
+and `lastError` to `{code: "unsupported", message: "server does not support D-ATIS"}`, and
+`subscribeDatis()` throws `Error("server does not support D-ATIS")`. METAR keeps working.
+A key without the scope gets `forbidden`, and a server with the product off gets `unavailable`;
+both land on `lastError`.
+
+`feed_notice` frames replace `client.notices` (whole state, `FeedNotice` JSDoc type) and call
+`onFeedNotice(notices)`. Opt out with `notices: false`, or later with `client.setNotices(false)`.
+
+D-ATIS from mobs-ws is not for operational or flight-safety use; it is best effort with no guarantee.
+
+```javascript
+const client = new MetarClient({
+  airports: ["KLGA"], datis: ["KLGA"], datisTypes: ["combined"],
+  onDatis: (rec) => console.log(rec.icao, rec.type, rec.letter, rec.text.slice(0, 60)),
+  onFeedNotice: (notices) => console.log(notices.map((n) => n.message)),
+});
 ```
 
 MIT licensed. See [LICENSE](https://github.com/Mobs-ws/mobs-sdks/blob/main/LICENSE).
