@@ -93,11 +93,11 @@ test("late alerts are tracked per outage and cleared on recovery", () => {
   assert.equal(client.seq, 12);
 });
 
-test("version is 0.18.0 and new error codes are exported", async () => {
+test("version is 0.18.1 and new error codes are exported", async () => {
   const { readFileSync } = await import("node:fs");
   const { MAX_GRANTS, ERROR_CODES, KNOWN_PLATFORMS } = await import("../src/index.js");
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(pkg.version, "0.18.0");
+  assert.equal(pkg.version, "0.18.1");
   assert.ok(ERROR_CODES.includes("forbidden"));
   assert.ok(ERROR_CODES.includes("unavailable"));
   assert.equal(MAX_GRANTS, 10);

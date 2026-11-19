@@ -11,10 +11,12 @@ import {
   mergeDatis,
 } from "../src/index.js";
 
-function rec(letter = "U", issued = "2026-11-19T11:51:00.000Z", revision = 0, extra = {}) {
+function rec(letter = "U", issued = "2026-11-19T11:51:00+00:00", revision = 0, extra = {}) {
   return Object.assign({
-    icao: "KLGA", type: "combined", letter, issued_at: issued, datis_time: issued.slice(11, 13) + issued.slice(14, 16),
-    text: "KLGA ATIS INFO " + letter, arrived_at: issued, source: "swim", source_time: issued, revision,
+    icao: "KLGA", type: "combined", letter, issued_at: issued,
+    datis_time: issued.slice(8, 10) + issued.slice(11, 13) + issued.slice(14, 16),
+    text: "KLGA ATIS INFO " + letter, arrived_at: issued.slice(0, 16) + ":41.205+00:00", source: "swim",
+    source_time: issued.slice(0, 16) + ":40.912+00:00", revision,
     versions: `KLGA/combined/${letter}/${issued.slice(0, 16)}Z/${revision}`,
   }, extra);
 }
@@ -45,7 +47,7 @@ test("merge keeps the newest issue, then revision", () => {
   assert.equal(mergeDatis(latest, rec("U")), false);
   assert.equal(mergeDatis(latest, rec("U", undefined, 1)), true);
   assert.equal(mergeDatis(latest, rec("U")), false);
-  assert.equal(mergeDatis(latest, rec("V", "2026-11-19T12:51:00.000Z")), true);
+  assert.equal(mergeDatis(latest, rec("V", "2026-11-19T12:51:00+00:00")), true);
   assert.equal(mergeDatis(latest, rec("U", undefined, 2)), false);
   assert.equal(latest["KLGA/combined"].letter, "V");
 });
@@ -60,7 +62,7 @@ test("frames feed onDatis, seq and onFeedNotice", () => {
   client.handleFrame({type: "new_datis_arrived", cached: true, replay: false, seq: 5, data: [rec()]});
   assert.equal(client.seq, null);
   client.handleFrame({type: "new_datis_arrived", cached: false, replay: false, seq: 6, backlog: true,
-    data: [rec("V", "2026-11-19T12:51:00.000Z")]});
+    data: [rec("V", "2026-11-19T12:51:00+00:00")]});
   assert.equal(client.seq, 6);
   assert.deepEqual(seen, ["U", "V"]);
   const entry = {id: "n1", feed: "datis", source: "swim", icaos: null, kind: "outage", message: "SWIM down",
@@ -116,4 +118,39 @@ test("wire bodies: wanted types, subscribe, unsubscribe, notices", () => {
     {action: "subscribe", notices: true},
   ]);
   assert.deepEqual(client.datis, ["KLGA"]);
+});
+
+// 0.18.1: amended (server v0.46.0+) and the real record time shapes.
+test("amended passes through merge and onDatis, absent when the server omits it", () => {
+  const seen = [];
+  const client = new MetarClient({token: "YOUR_API_KEY", airports: ["KLGA"], datis: ["KLGA"], onDatis: (r) => seen.push(r)});
+  client.handleFrame(hello({datis_icaos: ["KLGA"], datis_types: ["combined", "arr", "dep"]}));
+  client.handleFrame({type: "new_datis_arrived", cached: false, replay: false, seq: 6, data: [rec("O")]});
+  client.handleFrame({type: "new_datis_arrived", cached: false, replay: false, seq: 7, data: [rec("P", undefined, 0, {amended: true})]});
+  assert.deepEqual(seen.map((r) => [r.letter, r.amended]), [["O", undefined], ["P", true]]);
+  assert.equal("amended" in seen[0], false);
+  const held = client.datisLatest["KLGA/combined"];
+  assert.equal(held.letter, "P");
+  assert.equal(held.amended, true);
+  // Round trip: the held record is the server object, field order included, amended last.
+  const wire = rec("P", undefined, 0, {amended: true});
+  assert.deepEqual(JSON.parse(JSON.stringify(held)), wire);
+  assert.deepEqual(Object.keys(held), ["icao", "type", "letter", "issued_at", "datis_time", "text", "arrived_at",
+    "source", "source_time", "revision", "versions", "amended"]);
+});
+
+test("same issued_at, new letter, revision 0 (an amendment) replaces the held record", () => {
+  const latest = {};
+  assert.equal(mergeDatis(latest, rec("O")), true);
+  assert.equal(mergeDatis(latest, rec("P", undefined, 0, {amended: true})), true);
+  assert.equal(latest["KLGA/combined"].letter, "P");
+  assert.equal(mergeDatis(latest, rec("P", undefined, 0, {amended: true})), false);  // same versions
+});
+
+test("record time shapes: +00:00, issued_at without milliseconds", () => {
+  const r = rec();
+  assert.match(r.issued_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00\+00:00$/);
+  assert.match(r.arrived_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+00:00$/);
+  assert.match(r.source_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+00:00$/);
+  assert.equal(r.datis_time, "191151");
 });

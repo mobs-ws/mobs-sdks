@@ -13,7 +13,8 @@ Both clients speak **protocol 4** (snapshot, resume, `awc_confirmed`,
 the `usage` frame, and — from 0.17.0 — US `state` / `bbox` region grants
 and `polymarket_com` / `polymarket_us` platform grants, and — from 0.18.0,
 with server v0.44.0+ — per-station D-ATIS (`new_datis_arrived`) and
-`feed_notice`; see [CHANGELOG](CHANGELOG.md)). A grant counts
+`feed_notice`, plus from 0.18.1 the `amended` D-ATIS flag (server v0.46.0+);
+see [CHANGELOG](CHANGELOG.md)). A grant counts
 as one subscription; a socket may hold at most 10. Snapshot frames are
 marked `cached`. On reconnect, the first state, first bounding box, and
 first platform are resumed so their stations can be replayed; any extra

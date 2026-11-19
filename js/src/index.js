@@ -3,6 +3,8 @@
 // No runtime dependencies: uses the global WebSocket (browser and Node 22+).
 // The token comes only from the caller or the MOBS_TOKEN environment
 // variable. It is never embedded.
+// 0.18.1: the optional `amended` field on DatisRecord (server v0.46.0+) and
+// corrected record time notes.
 // 0.18.0 (server v0.44.0+): per-station D-ATIS (`datis` option or
 // subscribeDatis(); the key needs the `datis` scope), new_datis_arrived kept
 // per (icao, type) newest issued_at then revision, onDatis, datis_fallback
@@ -86,18 +88,24 @@ export function applyAwcConfirmed(latest, message) {
 
 /**
  * One D-ATIS bulletin (`data[]` of new_datis_arrived, and GET /v1/datis rows).
+ * Records are the server's plain objects, passed through unchanged (unknown fields kept).
+ * Record times end in `+00:00`; feed notice times and /v1/status `last_published_at` end in `Z`.
+ * Measure latency as `arrived_at` minus `source_time`, never from `issued_at`.
  * @typedef {Object} DatisRecord
  * @property {string} icao
  * @property {"combined"|"arr"|"dep"} type
  * @property {string} letter
- * @property {string} issued_at      ISO 8601, milliseconds, Z
- * @property {string|null} datis_time HHMM as broadcast
+ * @property {string} issued_at      The broadcast's HHMMZ, "YYYY-MM-DDTHH:MM:00+00:00" (no milliseconds)
+ * @property {string|null} datis_time SWIM DATISTime (ddhhmm) as sent; null from atis.info
  * @property {string} text
- * @property {string} arrived_at
+ * @property {string} arrived_at     "YYYY-MM-DDTHH:MM:SS.mmm+00:00"
  * @property {"swim"|"atis.info"} source
- * @property {string|null} source_time
+ * @property {string|null} source_time "YYYY-MM-DDTHH:MM:SS.mmm+00:00" (SWIM sender stamp or atis.info updatedAt), or null
  * @property {number} revision
  * @property {string} versions       e.g. "KLGA/combined/U/2026-11-19T11:51Z/0"
+ * @property {boolean} [amended]     0.18.1 (server v0.46.0+): true when the letter changed under the same
+ *                                   issued_at as the held bulletin for this icao/type (a real amendment,
+ *                                   revision 0); absent otherwise, never false
  */
 
 /**
@@ -109,9 +117,9 @@ export function applyAwcConfirmed(latest, message) {
  * @property {string[]|null} icaos
  * @property {string} kind
  * @property {string} message
- * @property {string} starts_at
- * @property {string|null} ends_at
- * @property {string} posted_at
+ * @property {string} starts_at    "YYYY-MM-DDTHH:MM:SS.mmmZ"
+ * @property {string|null} ends_at "YYYY-MM-DDTHH:MM:SS.mmmZ", or null
+ * @property {string} posted_at    "YYYY-MM-DDTHH:MM:SS.mmmZ"
  * @property {string} posted_by
  */
 

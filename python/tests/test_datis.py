@@ -17,18 +17,18 @@ from mobs_ws import (
 )
 
 
-def _rec(letter="U", issued="2026-11-19T11:51:00.000Z", revision=0, text="KLGA ATIS INFO U", **extra):
+def _rec(letter="U", issued="2026-11-19T11:51:00+00:00", revision=0, text="KLGA ATIS INFO U", **extra):
     hhmm = issued[11:13] + issued[14:16]
     rec = {
         "icao": "KLGA",
         "type": "combined",
         "letter": letter,
         "issued_at": issued,
-        "datis_time": hhmm,
+        "datis_time": issued[8:10] + hhmm,
         "text": text,
-        "arrived_at": issued,
+        "arrived_at": issued[:16] + ":41.205+00:00",
         "source": "swim",
-        "source_time": issued,
+        "source_time": issued[:16] + ":40.912+00:00",
         "revision": revision,
         "versions": f"KLGA/combined/{letter}/{issued[:16]}Z/{revision}",
     }
@@ -58,7 +58,7 @@ def test_merge_keeps_newest_issue_then_revision():
     assert not merge_datis(latest, _rec("U"))  # same versions
     assert merge_datis(latest, _rec("U", revision=1, text="KLGA ATIS INFO U RWY 22"))
     assert not merge_datis(latest, _rec("U"))  # older revision (late snapshot)
-    assert merge_datis(latest, _rec("V", issued="2026-11-19T12:51:00.000Z"))
+    assert merge_datis(latest, _rec("V", issued="2026-11-19T12:51:00+00:00"))
     assert not merge_datis(latest, _rec("U", revision=2))  # older issue
     assert latest[("KLGA", "combined")]["letter"] == "V"
     rec = DatisRecord.from_dict(latest[("KLGA", "combined")])
@@ -73,7 +73,7 @@ def test_frames_feed_on_datis_seq_and_notices():
     client.handle_frame({"type": "new_datis_arrived", "cached": True, "replay": False, "seq": 5, "data": [_rec()]})
     assert client.seq is None  # snapshots never advance seq
     client.handle_frame({"type": "new_datis_arrived", "cached": False, "replay": False, "seq": 6, "backlog": True,
-                         "data": [_rec("V", issued="2026-11-19T12:51:00.000Z")]})
+                         "data": [_rec("V", issued="2026-11-19T12:51:00+00:00")]})
     assert client.seq == 6
     assert [r["letter"] for r in seen] == ["U", "V"]
     entry = {"id": "n1", "feed": "datis", "source": "swim", "icaos": None, "kind": "outage", "message": "SWIM down",
@@ -155,3 +155,51 @@ def test_live_socket_subscribe_unsubscribe_types_and_notices():
         {"action": "subscribe", "notices": True},
     ]
     assert client.datis == ["KLGA"] and client.notices_enabled is True
+
+
+# ---------------------------------------------------------------- 0.18.1: amended (server v0.46.0+)
+
+FIELDS = ["icao", "type", "letter", "issued_at", "datis_time", "text", "arrived_at", "source", "source_time",
+          "revision", "versions"]
+
+
+def test_datis_record_amended_absent_reads_false_and_round_trips_without_it():
+    wire = _rec("O")
+    rec = DatisRecord.from_dict(wire)
+    assert rec.amended is False
+    assert rec.to_dict() == wire and list(rec.to_dict()) == FIELDS
+    assert "amended=False" in repr(rec)
+
+
+def test_datis_record_amended_true_round_trips_last():
+    wire = _rec("P", amended=True)
+    rec = DatisRecord.from_dict(wire)
+    assert rec.amended is True and rec.letter == "P" and rec.revision == 0
+    out = rec.to_dict()
+    assert out == wire and list(out) == FIELDS + ["amended"]
+    assert DatisRecord.from_dict(json.loads(json.dumps(out))) == rec
+    assert "amended=True" in repr(rec)
+    # Only a real True counts; anything else reads as False.
+    assert DatisRecord.from_dict(_rec("P", amended="yes")).amended is False
+
+
+def test_amended_passes_through_on_datis_and_merge():
+    seen = []
+    client = MetarClient(["KLGA"], token="YOUR_API_KEY", datis=["KLGA"], on_datis=seen.append)
+    client.handle_frame(_hello(datis_icaos=["KLGA"], datis_types=["combined", "arr", "dep"]))
+    client.handle_frame({"type": "new_datis_arrived", "cached": False, "replay": False, "seq": 6, "data": [_rec("O")]})
+    client.handle_frame({"type": "new_datis_arrived", "cached": False, "replay": False, "seq": 7,
+                         "data": [_rec("P", amended=True)]})
+    assert [(r["letter"], r.get("amended")) for r in seen] == [("O", None), ("P", True)]
+    held = client.datis_latest[("KLGA", "combined")]
+    assert held == _rec("P", amended=True) and list(held)[-1] == "amended"
+    assert DatisRecord.from_dict(held).amended is True
+
+
+def test_record_time_shapes():
+    import re
+
+    rec = _rec()
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00\+00:00", rec["issued_at"])
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+00:00", rec["arrived_at"])
+    assert rec["datis_time"] == "191151"

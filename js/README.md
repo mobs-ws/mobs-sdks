@@ -3,7 +3,7 @@
 Official JavaScript client for the MOBS `/v1/ws/metar` WebSocket (protocol 4).
 
 Requires Node 22+ (or a browser). `mobs-ws` 0.17.0+ for region and
-platform subscriptions, 0.18.0 for D-ATIS and feed notices (server v0.44.0+). There are no runtime dependencies. The client
+platform subscriptions, 0.18.0 for D-ATIS and feed notices (server v0.44.0+), 0.18.1 for the `amended` D-ATIS flag (server v0.46.0+). There are no runtime dependencies. The client
 uses the global `WebSocket` in the browser and in Node 22+. Snapshot
 and resume are opt-in. The client applies `awc_confirmed` frames
 last-wins per (`icao`, `versions`), handles `station_late`,
@@ -30,7 +30,7 @@ uses `?token=` because a page cannot set socket headers. A browser
 `WebSocket` cannot see a handshake 401 or 403, so the client retries.
 
 ```bash
-npm install mobs-ws@0.18.0
+npm install mobs-ws@0.18.1
 export MOBS_TOKEN=$MOBS_TOKEN
 ```
 
@@ -61,6 +61,12 @@ fires when it changes. Snapshot frames (`cached: true`) do not advance `seq`. `b
 newer copy that arrived late. `datisTypes` (`combined`, `arr`, `dep`) are sent with a subscribe
 once the socket opens. On a resume fallback with `datis_fallback`, the client refetches
 `GET /v1/datis/latest`.
+
+Records are the server's objects, unchanged. Record times end in `+00:00`: `issued_at` is the
+broadcast's HHMMZ (`YYYY-MM-DDTHH:MM:00+00:00`, no milliseconds), and `arrived_at` and `source_time` carry
+milliseconds. Feed notice times end in `Z`. Measure latency as `arrived_at` minus `source_time`.
+From 0.18.1 (server v0.46.0+), `amended: true` marks a new letter issued under the same
+`issued_at` (a real amendment, `revision` 0). The field is absent otherwise.
 
 A server without D-ATIS answers with no `datis_icaos`. The client then sets `datisSupported = false`
 and `lastError` to `{code: "unsupported", message: "server does not support D-ATIS"}`, and
