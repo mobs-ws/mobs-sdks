@@ -1,6 +1,6 @@
 {
   "name": "mobs-ws",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "Official client for the MOBS /v1/ws/metar WebSocket (protocol 4).",
   "license": "MIT",
   "type": "module",

@@ -20,6 +20,7 @@ exposed on last_error. Snapshot frames are marked cached. On
 reconnect, grants are re-subscribed with since_seq and boot_id so
 grant stations can be replayed (they cannot go on the handshake query).
 
+0.18.1: ``DatisRecord.amended`` (server v0.46.0+) and ``DatisRecord.to_dict()``.
 0.18.0 (server v0.44.0+): per-station D-ATIS with ``datis=`` on the
 handshake or ``subscribe_datis()`` mid-session (the key needs the
 ``datis`` scope), ``new_datis_arrived`` kept per (icao, type) newest
@@ -144,7 +145,20 @@ def apply_awc_confirmed(latest: dict[str, dict], message: dict) -> dict:
 
 @dataclass(frozen=True)
 class DatisRecord:
-    """One D-ATIS bulletin as the server sends it (``data[]`` of ``new_datis_arrived``)."""
+    """One D-ATIS bulletin as the server sends it (``data[]`` of ``new_datis_arrived``,
+    and ``GET /v1/datis`` rows).
+
+    Record times end in ``+00:00`` (feed notice times and ``last_published_at`` on
+    ``/v1/status`` end in ``Z``): ``issued_at`` is the broadcast's HHMMZ as
+    ``YYYY-MM-DDTHH:MM:00+00:00`` (no milliseconds); ``arrived_at`` and ``source_time``
+    carry milliseconds (``YYYY-MM-DDTHH:MM:SS.mmm+00:00``). ``datis_time`` is SWIM's
+    ``DATISTime`` (ddhhmm) as sent, None from atis.info. Measure latency as
+    ``arrived_at`` minus ``source_time``, never from ``issued_at``.
+
+    ``amended`` (0.18.1, server v0.46.0+): True when the letter changed under the same
+    ``issued_at`` as the station's held bulletin for that type (a real amendment,
+    ``revision`` 0). The server omits the field otherwise; it reads as False here.
+    """
 
     icao: str
     type: str
@@ -157,6 +171,7 @@ class DatisRecord:
     source_time: str | None
     revision: int
     versions: str
+    amended: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> "DatisRecord":
@@ -172,7 +187,27 @@ class DatisRecord:
             source_time=data.get("source_time"),
             revision=int(data.get("revision") or 0),
             versions=str(data.get("versions") or ""),
+            amended=data.get("amended") is True,
         )
+
+    def to_dict(self) -> dict:
+        """The server's shape and field order; ``amended`` only when True (as the server sends it)."""
+        out = {
+            "icao": self.icao,
+            "type": self.type,
+            "letter": self.letter,
+            "issued_at": self.issued_at,
+            "datis_time": self.datis_time,
+            "text": self.text,
+            "arrived_at": self.arrived_at,
+            "source": self.source,
+            "source_time": self.source_time,
+            "revision": self.revision,
+            "versions": self.versions,
+        }
+        if self.amended:
+            out["amended"] = True
+        return out
 
 
 def datis_key(record: dict) -> tuple[str, str]:

@@ -3,7 +3,7 @@
 Official Python client for the MOBS `/v1/ws/metar` WebSocket (protocol 4).
 
 Requires Python 3.11+. `mobs-ws` 0.17.0+ for region and platform
-subscriptions, 0.18.0 for D-ATIS and feed notices (server v0.44.0+). The only runtime dependency is `websockets`. HTTP backfill
+subscriptions, 0.18.0 for D-ATIS and feed notices (server v0.44.0+), 0.18.1 for the `amended` D-ATIS flag (server v0.46.0+). The only runtime dependency is `websockets`. HTTP backfill
 uses urllib from the standard library. Snapshot and resume are opt-in.
 The client applies `awc_confirmed` frames last-wins per (`icao`,
 `versions`), handles `station_late`, `station_recovered`, and `usage`
@@ -27,7 +27,7 @@ The API key is never embedded. Pass it to the constructor, or set
 `MOBS_TOKEN`.
 
 ```bash
-pip install "mobs-ws>=0.18.0"
+pip install "mobs-ws>=0.18.1"
 export MOBS_TOKEN=$MOBS_TOKEN
 ```
 
@@ -66,7 +66,14 @@ needs the `datis` scope. Each `new_datis_arrived` record is kept in `datis_lates
 it changes. Snapshot frames (`cached: true`) do not advance `seq`. `backlog: true` marks a newer copy
 that arrived late. `datis_types` (`combined`, `arr`, `dep`) are sent with a subscribe once the
 socket opens. On a resume fallback with `datis_fallback`, the client refetches
-`GET /v1/datis/latest`. `DatisRecord.from_dict()` gives a typed view.
+`GET /v1/datis/latest`. `DatisRecord.from_dict()` gives a typed view, and `to_dict()` gives back the
+server's shape.
+
+Record times end in `+00:00`: `issued_at` is the broadcast's HHMMZ (`YYYY-MM-DDTHH:MM:00+00:00`, no
+milliseconds), and `arrived_at` and `source_time` carry milliseconds. Feed notice times end in `Z`.
+Measure latency as `arrived_at` minus `source_time`. From 0.18.1 (server v0.46.0+), `amended: true` marks
+a new letter issued under the same `issued_at` (a real amendment, `revision` 0). The server leaves the
+field out otherwise, and `DatisRecord.amended` is then `False`.
 
 A server without D-ATIS answers with no `datis_icaos`. The client then sets `datis_supported = False`
 and `last_error` to `{"code": "unsupported", "message": "server does not support D-ATIS"}`, and
