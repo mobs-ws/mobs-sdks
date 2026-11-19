@@ -20,6 +20,13 @@ exposed on last_error. Snapshot frames are marked cached. On
 reconnect, grants are re-subscribed with since_seq and boot_id so
 grant stations can be replayed (they cannot go on the handshake query).
 
+0.18.0 (server v0.44.0+): per-station D-ATIS with ``datis=`` on the
+handshake or ``subscribe_datis()`` mid-session (the key needs the
+``datis`` scope), ``new_datis_arrived`` kept per (icao, type) newest
+issued_at then revision, ``on_datis``, ``datis_fallback`` resync from
+GET /v1/datis/latest, and ``feed_notice`` (``notices``,
+``on_feed_notice``; opt out with ``notices=False``).
+
 The token comes only from the caller or the MOBS_TOKEN environment
 variable. It is never embedded.
 """
@@ -34,6 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from websockets.asyncio.client import connect
@@ -51,8 +59,12 @@ ERROR_CODES = frozenset(
         "invalid_region",
         "unknown_platform",
         "too_many_grants",
+        "forbidden",
+        "unavailable",
     }
 )
+DATIS_TYPES = ("combined", "arr", "dep")
+DATIS_UNSUPPORTED = "server does not support D-ATIS"
 PING_EVERY_S = 20.0
 PONG_TIMEOUT_S = 15.0
 BACKOFF_START_S = 1.0
@@ -130,6 +142,64 @@ def apply_awc_confirmed(latest: dict[str, dict], message: dict) -> dict:
     return latest
 
 
+@dataclass(frozen=True)
+class DatisRecord:
+    """One D-ATIS bulletin as the server sends it (``data[]`` of ``new_datis_arrived``)."""
+
+    icao: str
+    type: str
+    letter: str
+    issued_at: str
+    datis_time: str | None
+    text: str
+    arrived_at: str
+    source: str
+    source_time: str | None
+    revision: int
+    versions: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DatisRecord":
+        return cls(
+            icao=str(data.get("icao") or ""),
+            type=str(data.get("type") or ""),
+            letter=str(data.get("letter") or ""),
+            issued_at=str(data.get("issued_at") or ""),
+            datis_time=data.get("datis_time"),
+            text=str(data.get("text") or ""),
+            arrived_at=str(data.get("arrived_at") or ""),
+            source=str(data.get("source") or ""),
+            source_time=data.get("source_time"),
+            revision=int(data.get("revision") or 0),
+            versions=str(data.get("versions") or ""),
+        )
+
+
+def datis_key(record: dict) -> tuple[str, str]:
+    return (str(record.get("icao") or "").upper(), str(record.get("type") or ""))
+
+
+def merge_datis(latest: dict[tuple[str, str], dict], record: dict) -> bool:
+    """Keep the newest bulletin per (icao, type): later issued_at, then higher revision.
+
+    Returns True when ``latest`` changed. An older or identical copy (a snapshot
+    behind a live frame, a resume refetch) is ignored.
+    """
+    key = datis_key(record)
+    if not key[0] or not key[1]:
+        return False
+    held = latest.get(key)
+    if held is not None:
+        if record.get("versions") == held.get("versions"):
+            return False
+        mine = (str(record.get("issued_at") or ""), int(record.get("revision") or 0))
+        theirs = (str(held.get("issued_at") or ""), int(held.get("revision") or 0))
+        if mine < theirs:
+            return False
+    latest[key] = dict(record)
+    return True
+
+
 def handshake_url(
     base: str,
     airports: list[str],
@@ -137,10 +207,16 @@ def handshake_url(
     snapshot: bool = True,
     since_seq: int | None = None,
     boot_id: str | None = None,
+    datis: list[str] | None = None,
+    notices: bool = True,
 ) -> str:
     parsed = urllib.parse.urlsplit(base)
     params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
     params["airports"] = ",".join(airports)
+    if datis:
+        params["datis"] = ",".join(datis)
+    if not notices:
+        params["notices"] = "false"
     if snapshot:
         params["snapshot"] = "true"
     if since_seq is not None and boot_id:
@@ -150,11 +226,10 @@ def handshake_url(
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/v1/ws/metar", query, ""))
 
 
-def latest_url(base: str, airports: list[str]) -> str:
+def latest_url(base: str, airports: list[str], path: str = "/v1/metar/latest") -> str:
     parsed = urllib.parse.urlsplit(base)
     scheme = "https" if parsed.scheme in {"wss", "https"} else "http"
     netloc = parsed.netloc
-    path = "/v1/metar/latest"
     query = urllib.parse.urlencode({"airports": ",".join(airports)})
     return urllib.parse.urlunsplit((scheme, netloc, path, query, ""))
 
@@ -163,6 +238,24 @@ def fetch_latest(url: str, token: str, airports: list[str]) -> list[dict]:
     target = latest_url(url, airports)
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     request = urllib.request.Request(target, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            body = json.loads(response.read().decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return []
+    return list(body.get("data") or [])
+
+
+def datis_latest_url(base: str, icaos: list[str]) -> str:
+    return latest_url(base, icaos, "/v1/datis/latest")
+
+
+def fetch_datis_latest(url: str, token: str, icaos: list[str]) -> list[dict]:
+    """GET /v1/datis/latest for the held D-ATIS codes (resume fallback); [] on any failure."""
+    if not icaos:
+        return []
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    request = urllib.request.Request(datis_latest_url(url, icaos), headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             body = json.loads(response.read().decode())
@@ -180,6 +273,7 @@ class MetarClient:
     """Reconnecting client for /v1/ws/metar."""
 
     fetch_latest = staticmethod(fetch_latest)
+    fetch_datis_latest = staticmethod(fetch_datis_latest)
 
     def __init__(
         self,
@@ -194,6 +288,11 @@ class MetarClient:
         platform: str | None = None,
         on_record: Callable[[dict], Any] | None = None,
         on_frame: Callable[[dict], Any] | None = None,
+        datis: list[str] | None = None,
+        datis_types: list[str] | None = None,
+        on_datis: Callable[[dict], Any] | None = None,
+        notices: bool = True,
+        on_feed_notice: Callable[[list[dict]], Any] | None = None,
     ) -> None:
         self.url = url
         self.token = resolve_token(token)
@@ -219,6 +318,18 @@ class MetarClient:
         self.platforms: list[str] = []
         self._session_open = False
         self._grant_resume_pending = False
+        # 0.18.0: D-ATIS and feed notices.
+        self.datis: list[str] = [str(name).upper() for name in (datis or [])]
+        self.datis_types: list[str] | None = list(datis_types) if datis_types else None
+        self.on_datis = on_datis
+        self.datis_latest: dict[tuple[str, str], dict] = {}
+        self.held_datis: list[str] = list(self.datis)
+        self.datis_supported: bool | None = None  # None until the first subscription_updated
+        self.notices_enabled = bool(notices)
+        self.notices: list[dict] = []
+        self.on_feed_notice = on_feed_notice
+        self.held_datis_types: list[str] = []
+        self._datis_types_pending = False
         if state:
             self.states.append(str(state).upper())
         if bbox:
@@ -236,6 +347,8 @@ class MetarClient:
             snapshot=self.snapshot if not self.has_grants() else False,
             since_seq=self.seq if use_resume else None,
             boot_id=self.boot_id if use_resume else None,
+            datis=self.datis,
+            notices=self.notices_enabled,
         )
 
     def has_grants(self) -> bool:
@@ -248,6 +361,7 @@ class MetarClient:
                 self.boot_id = message["boot_id"]
             if "icaos" in message and isinstance(message.get("icaos"), list):
                 self.held_icaos = [str(item).upper() for item in message["icaos"]]
+            self._note_datis(message)
             if self._session_open:
                 self._remember_grants_from(message)
             elif self.has_grants():
@@ -257,8 +371,21 @@ class MetarClient:
             # current seq, and would skip replay frames not yet received.
         elif kind == "error":
             self.last_error = message
+            if message.get("code") in {"forbidden", "unavailable"}:
+                # The server knows D-ATIS but refused it (no datis scope, or the product is off).
+                self.datis_supported = None
         elif kind == "resume":
             self._apply_resume(self.fetch_latest(self.url, self.token, self.held_icaos or self.airports))
+            if message.get("datis_fallback") and self.held_datis:
+                self._apply_datis(self.fetch_datis_latest(self.url, self.token, self.held_datis))
+        elif kind == "new_datis_arrived":
+            self._apply_datis(message.get("data") or [])
+            if message.get("cached") is not True and message.get("seq") is not None:
+                self._advance_seq(message["seq"])
+        elif kind == "feed_notice":
+            self.notices = list(message.get("notices") or [])
+            if self.on_feed_notice is not None:
+                self.on_feed_notice(self.notices)
         elif kind == "new_metar_arrived":
             live = message.get("cached") is False and message.get("replay") is False
             replayed = message.get("replay") is True
@@ -298,6 +425,32 @@ class MetarClient:
         if self.seq is None or seq > self.seq:
             self.seq = seq
 
+    def _note_datis(self, message: dict) -> None:
+        first = not self._session_open
+        if isinstance(message.get("datis_icaos"), list):
+            self.datis_supported = True
+            self.held_datis = [str(item).upper() for item in message["datis_icaos"]]
+            if isinstance(message.get("datis_types"), list):
+                self.held_datis_types = [str(item) for item in message["datis_types"]]
+            # datis_types are subscribe-only: send the wanted types once per socket.
+            if first and self.datis_types and set(self.datis_types) != set(self.held_datis_types):
+                self._datis_types_pending = True
+        elif self.datis_supported is True:
+            self.held_datis = []
+            self.held_datis_types = []
+        elif self.datis and first:
+            # Asked for D-ATIS and the first answer has no datis_icaos: the server predates
+            # v0.44.0. A v0.44.0 server that refuses it follows with an error frame
+            # (forbidden or unavailable), which resets this. METAR keeps working either way.
+            self.datis_supported = False
+            self.last_error = {"type": "error", "code": "unsupported", "message": DATIS_UNSUPPORTED}
+
+    def _apply_datis(self, rows: list[dict]) -> None:
+        for rec in rows:
+            if isinstance(rec, dict) and merge_datis(self.datis_latest, rec):
+                if self.on_datis is not None:
+                    self.on_datis(self.datis_latest[datis_key(rec)])
+
     def _apply_resume(self, rows: list[dict]) -> None:
         for rec in rows:
             before = self.latest.get(rec.get("icao") or "")
@@ -308,6 +461,9 @@ class MetarClient:
         if message.get("type") == "resume":
             rows = await asyncio.to_thread(self.fetch_latest, self.url, self.token, self.held_icaos or self.airports)
             self._apply_resume(rows)
+            if message.get("datis_fallback") and self.held_datis:
+                datis_rows = await asyncio.to_thread(self.fetch_datis_latest, self.url, self.token, self.held_datis)
+                self._apply_datis(datis_rows)
             if self.on_frame is not None:
                 self.on_frame(message)
             return
@@ -458,8 +614,55 @@ class MetarClient:
                 body[key] = value
         await ws.send(json.dumps(body))
 
+    def _require_datis(self) -> None:
+        if self.datis_supported is False:
+            raise RuntimeError(DATIS_UNSUPPORTED)
+
+    async def subscribe_datis(self, icaos: list[str], *, types: list[str] | None = None, snapshot: bool | None = None) -> None:
+        """Add D-ATIS stations mid-session (the key needs the ``datis`` scope).
+
+        Raises RuntimeError("server does not support D-ATIS") once the server has shown it
+        has no D-ATIS (no ``datis_icaos`` on ``subscription_updated``).
+        """
+        self._require_datis()
+        codes = [str(item).upper() for item in icaos]
+        for code in codes:
+            if code not in self.datis:
+                self.datis.append(code)
+        fields: dict[str, Any] = {"datis": codes}
+        if types is not None:
+            fields["datis_types"] = list(types)
+            self.datis_types = list(types)
+        ws = self._ws
+        if ws is None:
+            return
+        body = self.subscribe_body(None, snapshot=snapshot, **fields)
+        await ws.send(json.dumps(body))
+
+    async def unsubscribe_datis(self, icaos: list[str]) -> None:
+        """Drop D-ATIS stations mid-session; METAR stations are untouched."""
+        self._require_datis()
+        codes = {str(item).upper() for item in icaos}
+        self.datis = [code for code in self.datis if code not in codes]
+        for key in [key for key in self.datis_latest if key[0] in codes]:
+            del self.datis_latest[key]
+        ws = self._ws
+        if ws is None:
+            return
+        await ws.send(json.dumps({"action": "unsubscribe", "datis": sorted(codes)}))
+
+    async def set_notices(self, enabled: bool) -> None:
+        """Turn ``feed_notice`` frames on or off for this socket (and later reconnects)."""
+        self.notices_enabled = bool(enabled)
+        ws = self._ws
+        if ws is not None:
+            await ws.send(json.dumps({"action": "subscribe", "notices": self.notices_enabled}))
+
     async def _flush_grant_resume(self) -> None:
         ws = self._ws
+        if self._datis_types_pending and ws is not None:
+            self._datis_types_pending = False
+            await ws.send(json.dumps({"action": "subscribe", "datis": list(self.datis), "datis_types": list(self.datis_types or [])}))
         if not self._grant_resume_pending or ws is None:
             return
         self._grant_resume_pending = False
@@ -503,6 +706,7 @@ class MetarClient:
                 ping_task = asyncio.create_task(heartbeat())
                 self._session_open = False
                 self._grant_resume_pending = False
+                self._datis_types_pending = False
                 async for text in ws:
                     if self._stop.is_set():
                         break

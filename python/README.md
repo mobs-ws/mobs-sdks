@@ -2,8 +2,8 @@
 
 Official Python client for the MOBS `/v1/ws/metar` WebSocket (protocol 4).
 
-Requires Python 3.11+ and `mobs-ws` 0.17.0 for region and platform
-subscriptions. The only runtime dependency is `websockets`. HTTP backfill
+Requires Python 3.11+. `mobs-ws` 0.17.0+ for region and platform
+subscriptions, 0.18.0 for D-ATIS and feed notices (server v0.44.0+). The only runtime dependency is `websockets`. HTTP backfill
 uses urllib from the standard library. Snapshot and resume are opt-in.
 The client applies `awc_confirmed` frames last-wins per (`icao`,
 `versions`), handles `station_late`, `station_recovered`, and `usage`
@@ -27,7 +27,7 @@ The API key is never embedded. Pass it to the constructor, or set
 `MOBS_TOKEN`.
 
 ```bash
-pip install "mobs-ws>=0.17.0"
+pip install "mobs-ws>=0.18.0"
 export MOBS_TOKEN=$MOBS_TOKEN
 ```
 
@@ -55,6 +55,36 @@ asyncio.run(main())
 
 ```bash
 python -m mobs_ws --airports KNYC,KLGA
+```
+
+## D-ATIS and feed notices (0.18.0, server v0.44.0+)
+
+Pass `datis=["KLGA"]` (handshake) or call `await client.subscribe_datis(["KJFK"], types=["combined"])`
+mid-session; `await client.unsubscribe_datis([...])` drops them without touching METAR. The key
+needs the `datis` scope. Each `new_datis_arrived` record is kept in `datis_latest` per
+`(icao, type)`: a later `issued_at` wins, then a higher `revision`. `on_datis(record)` fires when
+it changes. Snapshot frames (`cached: true`) do not advance `seq`. `backlog: true` marks a newer copy
+that arrived late. `datis_types` (`combined`, `arr`, `dep`) are sent with a subscribe once the
+socket opens. On a resume fallback with `datis_fallback`, the client refetches
+`GET /v1/datis/latest`. `DatisRecord.from_dict()` gives a typed view.
+
+A server without D-ATIS answers with no `datis_icaos`. The client then sets `datis_supported = False`
+and `last_error` to `{"code": "unsupported", "message": "server does not support D-ATIS"}`, and
+`subscribe_datis()` raises `RuntimeError("server does not support D-ATIS")`. METAR keeps working.
+A key without the scope gets `forbidden`, and a server with the product off gets `unavailable`;
+both land on `last_error`.
+
+`feed_notice` frames replace `client.notices` (whole state) and call `on_feed_notice(notices)`.
+Opt out with `notices=False`, or later with `await client.set_notices(False)`.
+
+D-ATIS from mobs-ws is not for operational or flight-safety use; it is best effort with no guarantee.
+
+```python
+client = MetarClient(
+    ["KLGA"], datis=["KLGA"], datis_types=["combined"],
+    on_datis=lambda rec: print(rec["icao"], rec["type"], rec["letter"], rec["text"][:60]),
+    on_feed_notice=lambda notices: print([n["message"] for n in notices]),
+)
 ```
 
 MIT licensed. See [LICENSE](https://github.com/Mobs-ws/mobs-sdks/blob/main/LICENSE).

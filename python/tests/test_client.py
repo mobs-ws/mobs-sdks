@@ -173,12 +173,14 @@ def test_connect_asyncio_timeout_backs_off(monkeypatch):
     asyncio.run(run())
 
 
-def test_version_is_0170():
-    assert mobs_ws.__version__ == "0.17.0"
+def test_version_is_0180():
+    assert mobs_ws.__version__ == "0.18.0"
     assert mobs_ws.MAX_GRANTS == 10
     assert "invalid_region" in mobs_ws.ERROR_CODES
     assert "unknown_platform" in mobs_ws.ERROR_CODES
     assert "too_many_grants" in mobs_ws.ERROR_CODES
+    assert {"forbidden", "unavailable"} <= mobs_ws.ERROR_CODES
+    assert mobs_ws.DATIS_TYPES == ("combined", "arr", "dep")
     assert mobs_ws.KNOWN_PLATFORMS == frozenset({"polymarket_com", "polymarket_us"})
 
 
